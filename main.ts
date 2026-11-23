@@ -1,16 +1,20 @@
-// Pump Sprint bot: a breakout rider on the pump.fun bonding-curve replay.
+// Pump Sprint bot: an early-floor rider on the pump.fun bonding-curve replay.
 //
-// Idea: most new curves dump; a few catch a wave of real buying. This bot waits for a
-// curve that has survived its first minutes, then buys only when the tape shows genuine
-// momentum — several distinct buyers, net SOL flowing in, price climbing and sitting near
-// its recent high — and gets out fast when the wave turns. Small equal-ish stakes spread
-// across many coins, so one rug cannot sink the run and the 20-coin guardrail is met by
-// turnover, not by holding everything.
+// Idea: most new curves dump, and buying after a rise is confirmed means buying the
+// top — the first version of this bot did exactly that and lost -3.79 SOL. The edge
+// here is the floor: a curve minutes old with almost no real SOL in it moves a lot in
+// % terms on any real buying, so the bot buys tiny (0.05 SOL) the moment a fresh coin
+// shows several distinct buyers and net SOL flowing in, then gets out fast on a stop
+// (-8%), take profit (+18%), trailing stop, fading flow, a big sell, or a 400-slot
+// time limit. One shot per position, no adds. Breadth is the point: over a hundred
+// small round trips across many coins, so one rug cannot sink the run and the 20-coin
+// guardrail is met by turnover. If breadth lags late in the run, the entry bar drops
+// (loose mode) rather than the bot sitting on cash.
 //
 // Money math: every trade pays 95 bps protocol + 30 bps creator on the curve plus a
-// 105,000-lamport tx fee, so a round trip costs roughly 2.5% + 0.00021 SOL. A 0.20 SOL
-// stake needs about a 4% move to break even, which is why entries demand a >= 4% rise
-// already in progress and exits take profit at +30% and cut losses at -15%.
+// 105,000-lamport tx fee, so a round trip costs roughly 2.5% + 0.00021 SOL. A 0.05 SOL
+// stake needs about a 4% move to break even, which is why entries demand a >= 2% rise
+// already in progress at the floor and exits take profit at +18% and cut losses at -8%.
 //
 // Determinism: every decision is a pure function of the replayed event stream. No clock,
 // no randomness, no environment reads. Iteration is over insertion-ordered maps fed by
@@ -26,31 +30,28 @@ import { LAMPORTS_PER_SOL, runBot, type BotState, type OrderInput } from './vend
 
 // --- tuning constants (SOL units unless noted) --------------------------------
 
-const WINDOW = 60; // entry lookback, in slots
-const MIN_AGE = 120; // slots since CreateEvent before a coin may be bought
+const WINDOW = 15; // entry lookback, in slots
+const MIN_AGE = 5; // slots since CreateEvent before a coin may be bought
 const MIN_BUYS = 5; // buy trades inside the window
 const MIN_BUYERS = 4; // distinct buying wallets inside the window
-const MIN_NET_SOL = 0.8; // net SOL (buys minus sells) inside the window
-const MIN_PRICE_UP = 0.04; // price now vs first price in the window
+const MIN_NET_SOL = 0.3; // net SOL (buys minus sells) inside the window
+const MIN_PRICE_UP = 0.02; // price now vs first price in the window
 const NEAR_HIGH = 0.97; // price now must be at least this share of the window high
 const MAX_TOP_BUYER_SHARE = 0.7; // largest single buyer's share of window buy SOL
-const MIN_REAL_SOL = 1; // real SOL reserves at entry
-const MAX_REAL_SOL = 100;
-const STAKE_SOL = 0.2; // first buy per position
-const ADD_SOL = 0.1; // one pyramid add per position
-const MAX_INVESTED_SOL = 0.3;
-const ADD_PRICE_UP = 0.06; // add only once price is this far above the entry price
-const ADD_MIN_NET_SOL = 0.5;
-const BUY_SLIPPAGE_BPS = 2500;
+const MIN_REAL_SOL = 0.2; // real SOL reserves at entry
+const MAX_REAL_SOL = 5; // buy near the floor: real SOL still tiny, so any buying pressure moves price a lot in % terms
+const LOOSE_MAX_REAL_SOL = 20; // breadth fallback widens this when coins lag
+const STAKE_SOL = 0.05; // first (and only) buy per position
+const BUY_SLIPPAGE_BPS = 1500;
 const SELL_SLIPPAGE_BPS = 10_000;
-const STOP_LOSS = 0.15; // sell when value falls this far below cost
-const TAKE_PROFIT = 0.3; // sell when value rises this far above cost
-const TRAIL_ARM = 0.1; // trailing stop arms once value reaches cost * (1 + arm)
-const TRAIL_DROP = 0.12; // ... then sell on a fall this far below the peak value
-const FADE_WINDOW = 20; // slots for the fade (sell-pressure) check
-const FADE_NET_SOL = -1.5; // sell when net flow over the fade window is below this
-const BIG_SELL_SOL = 3; // sell on any single recorded sell of at least this size
-const MAX_HOLD = 1500; // slots; the time limit only bites while the position is flat
+const STOP_LOSS = 0.08; // sell when value falls this far below cost
+const TAKE_PROFIT = 0.18; // sell when value rises this far above cost
+const TRAIL_ARM = 0.08; // trailing stop arms once value reaches cost * (1 + arm)
+const TRAIL_DROP = 0.08; // ... then sell on a fall this far below the peak value
+const FADE_WINDOW = 15; // slots for the fade (sell-pressure) check
+const FADE_NET_SOL = -0.8; // sell when net flow over the fade window is below this
+const BIG_SELL_SOL = 2; // sell on any single recorded sell of at least this size
+const MAX_HOLD = 400; // slots; the time limit only bites while the position is flat
 const HOLD_IF_UP = 0.05;
 const COOLDOWN = 200; // slots to wait after an exit before re-entering the same coin
 const MAX_ENTRIES_PER_COIN = 2;
@@ -63,8 +64,8 @@ const LAMPORTS = 1e9;
 // drops — breadth first, since a bot under 20 coins cannot place at all.
 const LOOSE_AFTER_SLOTS = 30_000;
 const LOOSE_MIN_COINS = 15;
-const LOOSE_MIN_NET_SOL = 0.4;
-const LOOSE_MIN_PRICE_UP = 0.02;
+const LOOSE_MIN_NET_SOL = 0.15;
+const LOOSE_MIN_PRICE_UP = 0.01;
 const LOOSE_MIN_BUYERS = 3;
 
 interface TapeTrade {
@@ -84,7 +85,6 @@ interface Tape {
 
 interface Held {
   opened: number;
-  entryPrice: number;
   peakValue: number;
   invested: number;
   exiting: boolean;
@@ -138,7 +138,8 @@ function netFlow(t: Tape, now: number, w: number): number {
 
 /** The entry signal: genuine momentum, not a single wallet pumping its own coin. */
 function entryOk(t: Tape, now: number, rqSol: number, loose: boolean): boolean {
-  if (rqSol < MIN_REAL_SOL || rqSol > MAX_REAL_SOL) return false;
+  const maxRq = loose ? LOOSE_MAX_REAL_SOL : MAX_REAL_SOL;
+  if (rqSol < MIN_REAL_SOL || rqSol > maxRq) return false;
   if (t.created === null || now - t.created < MIN_AGE) return false;
   const minNet = loose ? LOOSE_MIN_NET_SOL : MIN_NET_SOL;
   const minUp = loose ? LOOSE_MIN_PRICE_UP : MIN_PRICE_UP;
@@ -264,7 +265,8 @@ await runBot({
       orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: SELL_SLIPPAGE_BPS });
     }
 
-    // Entries and one pyramid add per position, in the order coins traded this batch.
+    // Entries only: one small buy per position, no adds. Adding into a pump.fun
+    // coin doubles down on the trades most likely to be the top.
     const loose = firstSlot !== null && now - firstSlot > LOOSE_AFTER_SLOTS && myCoins.size < LOOSE_MIN_COINS;
     let free = Number(state.freeCashLamports()) / LAMPORTS;
     let slotsLeft = state.hello.caps.max_open_positions - state.committedPositionCount();
@@ -274,27 +276,13 @@ await runBot({
       if (curve === undefined || curve.complete) continue;
       if (pendingByMint.has(mint)) continue;
       const t = tapes.get(mint)!;
-      const h = held.get(mint);
-      const price = priceOf(curve.virtual_quote_reserves, curve.virtual_token_reserves);
+      if (held.has(mint)) continue;
+      if (slotsLeft <= 0) continue;
+      if (t.entries >= MAX_ENTRIES_PER_COIN || now - t.lastExit < COOLDOWN) continue;
       const rqSol = Number(curve.real_quote_reserves) / LAMPORTS;
-      let want: number;
-      if (h === undefined) {
-        if (slotsLeft <= 0) continue;
-        if (t.entries >= MAX_ENTRIES_PER_COIN || now - t.lastExit < COOLDOWN) continue;
-        if (!entryOk(t, now, rqSol, loose)) continue;
-        want = STAKE_SOL;
-      } else {
-        // Pyramid into strength only: price stepped up from the entry and flow still in.
-        if (h.exiting || !h.filled || h.invested >= MAX_INVESTED_SOL - MIN_BUY_SOL) continue;
-        const pos = state.positions.get(mint);
-        if (pos === undefined) continue;
-        if (price < h.entryPrice * (1 + ADD_PRICE_UP)) continue;
-        if (netFlow(t, now, WINDOW) < ADD_MIN_NET_SOL) continue;
-        if (rqSol > MAX_REAL_SOL) continue;
-        want = Math.min(ADD_SOL, MAX_INVESTED_SOL - h.invested);
-      }
+      if (!entryOk(t, now, rqSol, loose)) continue;
       const capSol = Number(state.maxBuyLamports(mint)) / LAMPORTS;
-      let amount = Math.min(capSol, want);
+      let amount = Math.min(capSol, STAKE_SOL);
       if (amount > free - txSol) amount = free - txSol;
       if (amount < MIN_BUY_SOL) continue;
       orders.push({
@@ -304,20 +292,9 @@ await runBot({
         max_slippage_bps: BUY_SLIPPAGE_BPS,
       });
       free -= amount + txSol;
-      if (h === undefined) {
-        held.set(mint, {
-          opened: now,
-          entryPrice: price,
-          peakValue: 0,
-          invested: amount,
-          exiting: false,
-          filled: false,
-        });
-        t.entries++;
-        slotsLeft--;
-      } else {
-        h.invested += amount;
-      }
+      held.set(mint, { opened: now, peakValue: 0, invested: amount, exiting: false, filled: false });
+      t.entries++;
+      slotsLeft--;
     }
     return orders;
   },
